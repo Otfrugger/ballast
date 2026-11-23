@@ -79,6 +79,30 @@ Read-only entry points (`quote`, `ltv`, `margin_view` and the other getters) are
 - The gating contracts read pause flags from their own storage and only `Registry::pause` writes a
   flag, so a flag cannot currently be set on the contract that checks it. Tracked in #30 and #32.
 
+## Error codes
+
+Release wasm strips panic strings, so a trapped call otherwise shows only
+`VM call trapped: UnreachableCodeReached`. `ballast_common::Error`
+(`contracts/common/src/error.rs`) defines stable, typed contract error codes that become part of the
+ABI; callers (operators, `services/api`, the console) can map a code to a cause. Discriminants are
+stable: never renumber or reuse them; add new variants at the end.
+
+| Code | Variant | Meaning |
+|---|---|---|
+| 1 | `NotInitialized` | A required role/config entry has not been initialized yet. |
+| 2 | `AlreadyInitialized` | `initialize` (or another one-shot setup) was called a second time. |
+| 3 | `Paused` | The action is blocked by an active pause scope (or the `All` override). |
+| 4 | `TimelockNotElapsed` | A timelocked change was executed before its delay elapsed. |
+| 5 | `NotFound` | No entry exists for the supplied id/key (unknown, executed or cancelled). |
+| 6 | `InvalidInput` | An argument is out of range or otherwise unusable. |
+| 7 | `Unauthorized` | The caller is not authorized for this action. |
+
+`ballast-common` raises these with `panic_with_error!`; the access-control guards
+(`read_roles`, `accept_admin`, `execute_role_change`, `require_admin_or_keeper`) use them today, and
+their tests assert the codes through `try_` clients. The remaining common guards (`pause`, `risk`,
+`margin`) and the individual contracts still panic with strings and adopt the codes in follow-up
+issues, because downstream tests currently pin those strings.
+
 ## Building
 
 `soroban-sdk` 28.x's build script refuses a plain `cargo build --target wasm32-unknown-unknown`

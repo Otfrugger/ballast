@@ -3,8 +3,9 @@
 //! transaction to carry that address's authorization, so `require_admin` etc. double as the
 //! access-control check (PRD §6.2: `require_auth` on every user action).
 
+use crate::error::Error;
 use crate::timelock;
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, panic_with_error, Address, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,7 +67,7 @@ pub fn read_roles(env: &Env) -> Roles {
     env.storage()
         .instance()
         .get(&RolesKey::Roles)
-        .expect("ballast-common: roles not initialized")
+        .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
 }
 
 /// Authenticates the stored admin and returns its address.
@@ -122,7 +123,7 @@ pub fn accept_admin(env: &Env) {
         .storage()
         .instance()
         .get(&RolesKey::PendingAdmin)
-        .expect("ballast-common: no pending admin proposal");
+        .unwrap_or_else(|| panic_with_error!(env, Error::NotFound));
     pending.new_admin.require_auth();
 
     let mut roles = read_roles(env);
@@ -176,11 +177,10 @@ pub fn execute_role_change(env: &Env, id: u64) {
         .storage()
         .persistent()
         .get(&RolesKey::PendingRoleChange(id))
-        .expect("ballast-common: no such pending role change");
-    assert!(
-        timelock::is_ready(env, pending.executes_at),
-        "ballast-common: timelock has not elapsed"
-    );
+        .unwrap_or_else(|| panic_with_error!(env, Error::NotFound));
+    if !timelock::is_ready(env, pending.executes_at) {
+        panic_with_error!(env, Error::TimelockNotElapsed);
+    }
 
     let mut roles = read_roles(env);
     match pending.role {
@@ -207,7 +207,7 @@ pub fn require_admin_or_keeper(env: &Env, caller: &Address) -> Address {
     caller.require_auth();
     let roles = read_roles(env);
     if caller != &roles.admin && caller != &roles.keeper {
-        panic!("ballast-common: caller is neither admin nor keeper");
+        panic_with_error!(env, Error::Unauthorized);
     }
     caller.clone()
 }
@@ -240,6 +240,9 @@ mod test {
         }
         pub fn req_risk(env: Env) -> Address {
             require_risk(&env)
+        }
+        pub fn req_admin_or_keeper(env: Env, caller: Address) -> Address {
+            require_admin_or_keeper(&env, &caller)
         }
     }
 
@@ -423,5 +426,84 @@ mod test {
         let addr = Address::generate(&env);
         let id = client.queue(&RoleKind::Keeper, &addr);
         client.execute(&id);
+    }
+
+    // Typed-error assertions (#89): the guards above now raise `ballast_common::Error` via
+    // `panic_with_error!`, so a `try_` client surfaces the stable code instead of a stripped string.
+    #[test]
+    fn uninitialized_roles_report_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = ProbeClient::new(&env, &env.register(Probe, ()));
+        // No `set` call: roles were never written.
+        assert_eq!(
+            client.try_req_admin(),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::NotInitialized as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn accept_without_a_proposal_reports_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _roles) = setup(&env);
+        assert_eq!(
+            client.try_accept(),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::NotFound as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn execute_unknown_role_change_reports_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _roles) = setup(&env);
+        assert_eq!(
+            client.try_execute(&999),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::NotFound as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn execute_role_change_before_the_delay_reports_timelock_not_elapsed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _roles) = setup(&env);
+        let addr = Address::generate(&env);
+        let id = client.queue(&RoleKind::Keeper, &addr);
+        assert_eq!(
+            client.try_execute(&id),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::TimelockNotElapsed as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn a_stranger_admin_or_keeper_reports_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = ProbeClient::new(&env, &env.register(Probe, ()));
+        let roles = Roles {
+            admin: Address::generate(&env),
+            pauser: Address::generate(&env),
+            keeper: Address::generate(&env),
+            price_publisher: Address::generate(&env),
+            risk: Address::generate(&env),
+        };
+        client.set(&roles);
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_req_admin_or_keeper(&stranger),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::Unauthorized as u32
+            )))
+        );
     }
 }
